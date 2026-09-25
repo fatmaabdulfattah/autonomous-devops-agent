@@ -410,10 +410,24 @@ CONFIDENCE:
             # Back off once and retry with a smaller ask — covers both "request too
             # large" (413) and a transient per-minute exhaustion (429).
             retry_tokens = max(500, max_tokens // 2)
-            print(f"[LLMFixer] {status} from Groq ({exc}). "
-                  f"Retrying once with max_tokens={retry_tokens} after a short wait...")
-            time.sleep(5)
-            response = _call(retry_tokens)
+            wait = 5
+            # Groq tells us the real cap, e.g. "(OTPM): Limit 1000, Requested 1200"
+            import re as _re
+            m = _re.search(r"Limit (\d+), Requested (\d+)", str(exc))
+            if m and "output tokens" in str(exc):
+                retry_tokens = max(200, int(m.group(1)) - 50)   # fit under the per-minute cap
+                wait = 20                                      # let the minute window reset
+            print(f"[LLMFixer] {status} from Groq — free-tier limit. "
+                  f"Retrying once with max_tokens={retry_tokens} in {wait}s...")
+            time.sleep(wait)
+            try:
+                response = _call(retry_tokens)
+            except (RateLimitError, APIStatusError) as exc2:
+                raise RuntimeError(
+                    "Groq free-tier limit for this model is too small for this fix. "
+                    "Pick a model with higher limits (e.g. openai/gpt-oss-120b) or Gemini "
+                    "via menu [5] Change AI models."
+                ) from exc2
         else:
             raise
 

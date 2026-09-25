@@ -364,10 +364,10 @@ def _select_llm_providers_upfront(dashboard: Dashboard) -> dict:
         return {}
 
     providers = {}
+    # Knowledge + Self-Healing models are chosen later, only when an incident
+    # actually needs them (see _attach_lazy_llm_choice).
     agents = [
         ("scaffold",  "Scaffold Agent  — generates Dockerfile, k8s, CI/CD"),
-        ("knowledge", "Knowledge Agent — RAG + LLM solution generation"),
-        ("healing",   "Self-Healing Agent — applies code fixes"),
     ]
 
     print(f"\n{'═'*55}")
@@ -462,6 +462,74 @@ def _attach_llm_providers_to_orchestrator(orchestrator, dashboard, providers):
     orchestrator.event_bus.subscribe(EventType.INVESTIGATION_COMPLETE, _wrapped_investigation)
 
 
+# ── Lazy LLM choice for Knowledge / Self-Healing ─────────────────────────────
+# Asked at the moment the agent is about to work on an incident, not at startup.
+# Offers the last choice as the default (Enter = keep), so it stays one keypress.
+
+_LAZY_AGENTS = {
+    # registry name        selector key   method called by the orchestrator   label
+    "knowledge_agent"   : ("knowledge",   "run",        "Knowledge Agent — investigates the incident"),
+    "self_healing_agent": ("healing",     "remediate",  "Self-Healing Agent — writes the fix"),
+}
+
+
+def _attach_lazy_llm_choice(orchestrator, dashboard):
+    if not _LLM_SELECTOR_AVAILABLE:
+        return
+    session_choice: dict = {}
+
+    def _choose_now(key: str, label: str):
+        last = session_choice.get(key)
+        if last is None:
+            try:
+                last = get_llm_provider(agent=key, use_saved=True)   # last run's choice
+            except Exception:
+                last = None
+        dashboard.pause()
+        try:
+            if last is not None:
+                name = f"{getattr(last, 'name', '?').upper()} / {getattr(last, 'default_model', '?')}"
+                ans = input(f"\n  {_B}{label}{_R}\n  Use {name}?  [Enter = yes, c = choose another]: ").strip().lower()
+                if ans not in ("c", "change"):
+                    session_choice[key] = last
+                    return last
+            prov = get_llm_provider(agent=key)
+            session_choice[key] = prov
+            return prov
+        except Exception as e:
+            print(f"  {_YL}Model selection skipped ({e}) — keeping previous choice{_R}")
+            return last
+        finally:
+            dashboard.resume()
+
+    for agent_name, (key, method, label) in _LAZY_AGENTS.items():
+        agent = orchestrator.registry.get_agent(agent_name)
+        if agent is None or getattr(agent, "_lazy_llm_wrapped", False):
+            continue
+        original = getattr(agent, method, None)
+        if original is None:
+            continue
+
+        def _ensure(agent=agent, key=key, label=label, agent_name=agent_name):
+            prov = _choose_now(key, label)
+            if prov is not None and hasattr(agent, "set_llm_provider"):
+                agent.set_llm_provider(prov)
+                if not hasattr(orchestrator, "llm_providers"):
+                    orchestrator.llm_providers = {}
+                orchestrator.llm_providers[agent_name] = prov
+
+        if asyncio.iscoroutinefunction(original):
+            async def _wrapped(*a, _orig=original, _ensure=_ensure, **k):
+                _ensure()
+                return await _orig(*a, **k)
+        else:
+            def _wrapped(*a, _orig=original, _ensure=_ensure, **k):
+                _ensure()
+                return _orig(*a, **k)
+        setattr(agent, method, _wrapped)
+        agent._lazy_llm_wrapped = True
+
+
 # ── Event tracker — pauses dashboard around heavy output ──────────────────────
 
 # Events that trigger heavy agent output → pause before, resume after
@@ -481,7 +549,37 @@ _RESUME_AFTER = {
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
-async def _run_scaffold(rerun: bool = False):
+def _project_fingerprint(project_path: str) -> str:
+    """Hash of the project's files (not .git, envs, agent state). Used to detect
+    'no progress': a fix that leaves the project in a state we've already seen."""
+    import hashlib
+    skip = {".git", ".devops", ".self_healing_backups", "__pycache__", "node_modules",
+            ".venv", "venv", ".mypy_cache", ".pytest_cache"}
+    h = hashlib.sha256()
+    root = Path(project_path)
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames
+                             if d not in skip and not (Path(dirpath, d) / "pyvenv.cfg").exists())
+        for name in sorted(filenames):
+            if name in (".devops_state",):
+                continue
+            f = Path(dirpath, name)
+            try:
+                if f.stat().st_size > 5_000_000:
+                    continue
+                h.update(str(f.relative_to(root)).encode())
+                h.update(f.read_bytes())
+            except OSError:
+                pass
+    return h.hexdigest()
+
+
+# What happened in the last pipeline run (used by main() for auto re-runs)
+_LAST_RUN = {"cicd": "", "healed": False, "repo_url": ""}
+
+
+async def _run_scaffold(rerun: bool = False, auto: bool = False):
+    _LAST_RUN["cicd"], _LAST_RUN["healed"] = "", False
     project_path    = str(Path.cwd())
     scaffold_config = load_scaffold_config()
 
@@ -497,6 +595,8 @@ async def _run_scaffold(rerun: bool = False):
         email = _build_email_client()
 
     orchestrator = Orchestrator(email=email)
+    orchestrator.auto_mode     = auto
+    orchestrator.last_repo_url = _LAST_RUN.get("repo_url", "")
     dashboard    = Dashboard(orchestrator)
 
     # ── ProjectDB: open (or create) the project's history database ────────
@@ -523,7 +623,10 @@ async def _run_scaffold(rerun: bool = False):
     _skip_scaffold = False
     _run_flow      = True
 
-    if not first_run:
+    if auto:
+        # automatic re-run after an approved fix: keep files, no questions
+        _skip_scaffold = bool(_existing)
+    elif not first_run:
         if _existing:
             dashboard.pause()
             print(f"\n{'─'*55}")
@@ -569,7 +672,7 @@ async def _run_scaffold(rerun: bool = False):
         saved = get_all_agent_configs()
         if saved:
             llm_providers = {}
-            for agent_key in ("scaffold", "knowledge", "healing"):
+            for agent_key in ("scaffold",):
                 try:
                     llm_providers[agent_key] = get_llm_provider(
                         agent=agent_key, use_saved=True
@@ -593,6 +696,7 @@ async def _run_scaffold(rerun: bool = False):
     else:
         llm_providers = _select_llm_providers_upfront(dashboard)
     _attach_llm_providers_to_orchestrator(orchestrator, dashboard, llm_providers)
+    _attach_lazy_llm_choice(orchestrator, dashboard)
 
     # ── Register agents ───────────────────────────────────────────────────
     orchestrator.register_agent("scaffold_agent", ScaffoldAgent(scaffold_config))
@@ -667,8 +771,13 @@ async def _run_scaffold(rerun: bool = False):
             stage, msg = _stage_map[event.type]
             dashboard.set_stage(stage)
             dashboard.event(msg(event) if callable(msg) else msg)
+            if event.type == EventType.REMEDIATION_COMPLETE:
+                _LAST_RUN["healed"] = True
             if event.type == EventType.DEPLOYMENT_COMPLETE:
                 conclusion = event.data.get("conclusion", event.data.get("status", ""))
+                _LAST_RUN["cicd"] = conclusion
+                if event.data.get("repo_url"):
+                    _LAST_RUN["repo_url"] = event.data["repo_url"]
                 dashboard._cicd_status = (
                     "success" if conclusion == "success"
                     else "failed" if conclusion in ("failed", "failure")
@@ -715,6 +824,8 @@ async def _run_scaffold(rerun: bool = False):
         dry_run       = False,
         skip_scaffold = _skip_scaffold,
     )
+    if getattr(orchestrator, "last_repo_url", ""):
+        _LAST_RUN["repo_url"] = orchestrator.last_repo_url
 
     dashboard.set_stage("DONE")
     dashboard.event("pipeline complete")
@@ -747,12 +858,23 @@ def main():
 
     # ── Main loop — no recursion, no nested asyncio.run() ─────────────
     _rerun = False
+    _auto  = False
+    _auto_runs = 0
+    _seen_states: set = set()          # project states produced by fixes in this loop
+    # 0 = no limit (default). The loop still stops by itself when a fix makes
+    # no progress, or when the problem needs a manual fix.
+    try:
+        MAX_AUTO_RUNS = int(os.getenv("DEVOPS_MAX_AUTO_RUNS", "0"))
+    except ValueError:
+        MAX_AUTO_RUNS = 0
     while True:
         _db = None
+        _state_before = _project_fingerprint(project_path)
         try:
-            _db = asyncio.run(_run_scaffold(rerun=_rerun))
+            _db = asyncio.run(_run_scaffold(rerun=_rerun, auto=_auto))
         except KeyboardInterrupt:
             print("\n  Interrupted.")
+            _LAST_RUN["healed"] = False        # Ctrl+C always stops the auto loop
 
         try:
             state_file.write_text(
@@ -762,6 +884,42 @@ def main():
         except Exception:
             pass
 
+        # ── Automatic loop ─────────────────────────────────────────────────
+        # Keep going while every run fixes something NEW. Stop when:
+        #   • CI/CD is green                        → done
+        #   • nothing was fixed (manual fix needed, fix declined or failed)
+        #   • the fix made no progress (same project state as before / already seen)
+        #   • optional DEVOPS_MAX_AUTO_RUNS limit reached (0 = no limit)
+        _state_after = _project_fingerprint(project_path)
+        _progress = (_LAST_RUN["healed"] and _state_after != _state_before
+                     and _state_after not in _seen_states)
+        _seen_states.add(_state_before)
+        _seen_states.add(_state_after)
+        _limit_hit = MAX_AUTO_RUNS > 0 and _auto_runs >= MAX_AUTO_RUNS
+
+        if _LAST_RUN["cicd"] == "success":
+            if _auto_runs:
+                print(f"\n  ✔ CI/CD is green after {_auto_runs} automatic re-run(s).")
+            _auto_runs, _auto, _seen_states = 0, False, set()
+        elif _progress and not _limit_hit:
+            _auto_runs += 1
+            print(f"\n  ↻ Fix applied — pushing it and re-running CI/CD automatically "
+                  f"(run {_auto_runs}, Ctrl+C to stop)...")
+            if _db:
+                _db.close()
+            _rerun, _auto = True, True
+            continue
+        else:
+            if _LAST_RUN["healed"] and not _progress:
+                print("\n  ✘ The fix didn't change anything new (same error keeps coming back)."
+                      "\n    Stopping the automatic loop — check the last incident above.")
+            elif _limit_hit:
+                print(f"\n  ✘ Stopped after {MAX_AUTO_RUNS} automatic re-runs (DEVOPS_MAX_AUTO_RUNS).")
+            elif _LAST_RUN["cicd"]:
+                print("\n  ⏸ This problem needs a manual fix (see the steps above)."
+                      "\n    Fix it, then choose [1] Run pipeline again.")
+            _auto_runs, _auto, _seen_states = 0, False, set()
+
         print(f"\n{'─'*55}")
         print(f"  Pipeline complete. What would you like to do?")
         print(f"{'─'*55}")
@@ -769,9 +927,10 @@ def main():
         print(f"  [2] Open chat agent (manual tasks)")
         print(f"  [3] Query history  (incidents · events · solutions)")
         print(f"  [4] Exit")
+        print(f"  [5] Change AI models (provider / model for each agent)")
         print(f"{'─'*55}")
         try:
-            _choice = input("  Choose [1-4]: ").strip()
+            _choice = input("  Choose [1-5]: ").strip()
         except (EOFError, KeyboardInterrupt):
             _choice = "4"
 
@@ -788,6 +947,19 @@ def main():
         elif _choice == "3":
             _open_history(_db, project_path)
             continue               # return to menu after history exits
+
+        elif _choice == "5":
+            try:
+                from providers.llm.llm_selector import reset_agent_choices
+                reset_agent_choices()
+                import agents.monitoring_agent.groq_analyzer as _ga
+                _ga._provider = None
+                print("\n  ✔ Saved models cleared (your API keys are kept).")
+                print("    Choose [1] — you'll pick Scaffold + Monitoring now, and")
+                print("    Knowledge + Self-Healing when an incident happens.")
+            except Exception as e:
+                print(f"  Could not reset models: {e}")
+            continue
 
         # [4] or anything else → exit
         if _db:

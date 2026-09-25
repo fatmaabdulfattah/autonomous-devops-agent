@@ -552,20 +552,38 @@ class Orchestrator:
             self.print_dashboard("Dry-run complete — no CI/CD triggered")
             return
 
-        approved = await self.approval.request_approval(
-            title=f"Scaffold complete — {framework} ({language}). Proceed to CI/CD?",
-            details=files,
-            context={"project_path": project_path},
-        )
+        auto_mode = getattr(self, "auto_mode", False)
+        if auto_mode:
+            # automatic re-run after an approved fix: pushing that fix is the next step
+            print("\n  ↻ Auto re-run — pushing the approved fix and re-running CI/CD")
+            approved = True
+        else:
+            approved = await self.approval.request_approval(
+                title=f"Scaffold complete — {framework} ({language}). Proceed to CI/CD?",
+                details=files,
+                context={"project_path": project_path},
+            )
         if not approved:
             logger.info("[Orchestrator] CI/CD cancelled by developer.")
             print("\n  Pipeline stopped. No CI/CD triggered.\n")
             return
 
-        repo_url = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: input("\n  GitHub repo URL (https://github.com/user/repo): ").strip()
-        )
+        import os as _os
+        env_url     = _os.getenv("GITHUB_REPO", "").strip()
+        default_url = env_url or getattr(self, "last_repo_url", "") or self._current_remote_url(project_path)
+        if env_url:
+            repo_url = env_url
+            print(f"  Repo: {repo_url}  (GITHUB_REPO from .env)")
+        elif auto_mode and default_url:
+            repo_url = default_url
+            print(f"  Repo: {repo_url}")
+        else:
+            hint = f" [Enter = {default_url}]" if default_url else " (https://github.com/user/repo)"
+            repo_url = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: input(f"\n  GitHub repo URL{hint}: ").strip()
+            ) or default_url
+        self.last_repo_url = repo_url
         if not repo_url:
             print("  No repo URL — stopping.\n")
             return
@@ -618,20 +636,21 @@ class Orchestrator:
 
             # GitHub Actions can take 30-90s to register a new run after a push.
             # We poll every 10s for up to 2 minutes before giving up.
-            print("  Waiting for GitHub Actions run to appear (up to 2 min)...")
+            sha = getattr(self, "last_pushed_sha", "")
+            print(f"  Waiting for the GitHub Actions run of commit {sha[:7] or '?'} (up to 2 min)...")
             run = None
             for _attempt in range(12):          # 12 × 10s = 120s max
                 await asyncio.sleep(10)
                 self.print_dashboard(f"Waiting for GitHub Actions run… ({(_attempt+1)*10}s)")
-                run = await self._get_latest_run(cicd_agent, repo, token)
+                run = await self._get_latest_run(cicd_agent, repo, token, sha=sha)
                 if run:
                     break
 
             if not run:
                 self._dash("cicd_status", "no run found")
                 self.print_dashboard(
-                    "No GitHub Actions run found after 2 min — "
-                    "check repo URL, GITHUB_TOKEN, and that a workflow .yml exists in .github/workflows/"
+                    f"No GitHub Actions run for commit {sha[:7]} after 2 min — "
+                    "check that .github/workflows/deploy.yml exists and runs on push to main"
                 )
                 return
 
@@ -639,6 +658,24 @@ class Orchestrator:
             status = run["status"]
             logger.info(f"[Orchestrator] GitHub Actions Run ID: {run_id}")
             step("Run ID", str(run_id))
+
+            # Nothing new was pushed (e.g. you only fixed secrets/settings on GitHub):
+            # GitHub starts no new run, so re-run the last one — like "Re-run all jobs".
+            if getattr(self, "last_push_noop", False) and status == "completed":
+                print("  No new commit — re-running the last GitHub Actions run "
+                      "(picks up secrets/settings you changed on GitHub)...")
+                attempt_before = run.get("run_attempt", 1)
+                if await self._rerun_workflow(repo, run_id, token):
+                    for _ in range(12):                      # up to ~60s for GitHub to start it
+                        await asyncio.sleep(5)
+                        fresh = await self._get_run(cicd_agent, repo, run_id, token)
+                        if fresh and (fresh.get("run_attempt", 1) > attempt_before
+                                      or fresh.get("status") != "completed"):
+                            run, status = fresh, fresh.get("status", "queued")
+                            break
+                else:
+                    print("  ✘ Could not start a re-run (token needs the 'repo' + 'workflow' scopes).\n"
+                          "    Re-run it from the GitHub Actions tab instead.")
 
             while status in ("queued", "in_progress"):
                 await asyncio.sleep(15)
@@ -695,29 +732,63 @@ class Orchestrator:
 
     # ── CI/CD helpers (unchanged) ─────────────────────────────────────────────
 
-    async def _get_latest_run(self, cicd_agent, repo: str, token: str):
+    @staticmethod
+    def _pick_run(runs: list, sha: str = ""):
+        """The run for the commit we pushed (never an older run of another commit).
+        Prefers the agent's deploy.yml when the repo has several workflows."""
+        if sha:
+            runs = [r for r in runs if r.get("head_sha") == sha]
+        if not runs:
+            return None
+        for r in runs:
+            if str(r.get("path", "")).endswith("deploy.yml"):
+                return r
+        return runs[0]
+
+    async def _get_latest_run(self, cicd_agent, repo: str, token: str, sha: str = ""):
         import aiohttp
         headers = {
             "Authorization"       : f"Bearer {token}",
             "Accept"              : "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
         }
-        url = f"https://api.github.com/repos/{repo}/actions/runs?per_page=1&branch=main"
+        url = (f"https://api.github.com/repos/{repo}/actions/runs?per_page=20&head_sha={sha}"
+               if sha else
+               f"https://api.github.com/repos/{repo}/actions/runs?per_page=1&branch=main")
         for attempt in range(4):
             try:
                 async with aiohttp.ClientSession(headers=headers) as session:
                     async with session.get(url) as resp:
                         if resp.status == 200:
                             data = await resp.json()
-                            runs = data.get("workflow_runs", [])
-                            if runs:
-                                return runs[0]
+                            run = self._pick_run(data.get("workflow_runs", []), sha)
+                            if run:
+                                return run
             except Exception as e:
                 logger.warning(f"[Orchestrator] _get_latest_run attempt {attempt+1}: {e}")
             if attempt < 3:
                 await asyncio.sleep(8)
         logger.error("[Orchestrator] _get_latest_run: no run found after 4 attempts")
         return None
+
+    async def _rerun_workflow(self, repo: str, run_id: int, token: str) -> bool:
+        """POST /actions/runs/{id}/rerun — same as 'Re-run all jobs' on GitHub."""
+        import aiohttp
+        headers = {
+            "Authorization"       : f"Bearer {token}",
+            "Accept"              : "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        url = f"https://api.github.com/repos/{repo}/actions/runs/{run_id}/rerun"
+        try:
+            async with aiohttp.ClientSession(headers=headers) as session:
+                async with session.post(url) as resp:
+                    if resp.status in (201, 202, 204):
+                        return True
+                    logger.error("[Orchestrator] re-run failed: %s %s", resp.status, await resp.text())
+        except Exception as e:
+            logger.error(f"[Orchestrator] re-run failed: {e}")
+        return False
 
     async def _get_run(self, cicd_agent, repo: str, run_id: int, token: str):
         import aiohttp
@@ -742,6 +813,18 @@ class Orchestrator:
         except Exception as e:
             logger.error(f"[Orchestrator] _get_run_logs failed: {e}")
             return []
+
+    @staticmethod
+    def _current_remote_url(project_path: str) -> str:
+        """origin URL of the project, if any (never contains a token — see push)."""
+        import subprocess
+        try:
+            r = subprocess.run(["git", "-C", project_path, "remote", "get-url", "origin"],
+                               capture_output=True, text=True, timeout=10)
+            url = r.stdout.strip() if r.returncode == 0 else ""
+            return "" if "@" in url.split("//")[-1].split("/")[0] else url
+        except Exception:
+            return ""
 
     async def _push_to_github(self, project_path: str, repo_url: str, token: str) -> bool:
         import subprocess, os
@@ -800,9 +883,32 @@ class Orchestrator:
                 logger.error("[Orchestrator] git remote add failed: %s", r.stderr)
                 return False
 
+            # 6b. GitHub has commits we don't? put ours on top of theirs (rebase).
+            #     Nothing on GitHub is ever deleted; on a real conflict we undo
+            #     the attempt and stop with clear instructions.
+            f = run(["git", "-C", project_path, "fetch", "origin", "main"])
+            if f.returncode == 0:
+                behind = run(["git", "-C", project_path, "merge-base", "--is-ancestor",
+                              "FETCH_HEAD", "HEAD"]).returncode != 0
+                if behind:
+                    print("  [git] GitHub has newer commits — syncing them before pushing...")
+                    rb = run(["git", "-C", project_path, "rebase", "FETCH_HEAD"])
+                    if rb.returncode != 0:
+                        run(["git", "-C", project_path, "rebase", "--abort"])
+                        run(["git", "-C", project_path, "remote", "set-url", "origin", repo_url])
+                        print("\n  ✘ Can't combine your changes with GitHub's automatically —\n"
+                              "    the same lines were changed on both sides (merge conflict).\n"
+                              "    Fix it once by hand in your project:\n"
+                              "      git pull --rebase origin main\n"
+                              "      (resolve the conflicts, then: git add . && git rebase --continue)\n"
+                              "    then start devops again.\n")
+                        return False
+
             # 7. push — NOT --force: a force push would silently delete commits
             #    that teammates pushed to main.
             r = run(["git", "-C", project_path, "push", "-u", "origin", "main"])
+            # "Everything up-to-date" = no new commit → GitHub will NOT start a new run
+            self.last_push_noop = "up-to-date" in ((r.stdout or "") + (r.stderr or "")).lower()
 
             # 8. never leave the token in .git/config (plain text on disk)
             run(["git", "-C", project_path, "remote", "set-url", "origin", repo_url])
@@ -810,12 +916,13 @@ class Orchestrator:
             if r.returncode != 0:
                 logger.error("[Orchestrator] git push failed: %s", r.stderr)
                 if "rejected" in (r.stderr or "") or "fetch first" in (r.stderr or ""):
-                    print("\n  ✘ Push rejected: GitHub has commits you don't have locally.\n"
-                          "    Run this in your project, then start devops again:\n"
-                          "      git pull --rebase origin main\n")
+                    print("\n  ✘ Push rejected by GitHub (someone pushed at the same moment?).\n"
+                          "    Just run the pipeline again.\n")
                 return False
 
-            logger.info("[Orchestrator] Git push succeeded → %s", repo_url)
+            sha = run(["git", "-C", project_path, "rev-parse", "HEAD"]).stdout.strip()
+            self.last_pushed_sha = sha
+            logger.info("[Orchestrator] Git push succeeded → %s (%s)", repo_url, sha[:7])
             return True
 
         except Exception as e:

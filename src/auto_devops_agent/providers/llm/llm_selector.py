@@ -349,6 +349,13 @@ def get_llm_provider(
     return _build_provider(provider_name, api_key, model)
 
 
+def reset_agent_choices() -> None:
+    """Forget the saved provider/model per agent (API keys are kept)."""
+    cfg = _load_config()
+    cfg["agents"] = {}
+    _save_config(cfg)
+
+
 def get_all_agent_configs() -> dict:
     """Saved provider/model per agent, e.g. {"scaffold": {"provider": "groq", "model": "..."}}."""
     return _load_config().get("agents", {})

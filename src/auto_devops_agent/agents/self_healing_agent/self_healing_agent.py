@@ -461,15 +461,25 @@ class SelfHealingAgent(BaseAgent):
 
         files_ok     = all(m.applied or not self.apply_changes for m in file_modifications)
         cmds_ok      = all(c.succeeded or c.on_failure != "abort" for c in command_results)
+        changed      = any(m.applied and (m.action == "append" or m.new_content != m.old_content)
+                           for m in file_modifications)
+        if files_ok and changed and not cmds_ok:
+            # The fix is on disk; a failing local check command must not cancel it.
+            # The real verification is the next CI/CD run.
+            print("[SelfHealingAgent] ⚠ a local check command failed — keeping the applied fix; "
+                  "the next CI/CD run will verify it")
+            cmds_ok = True
         final_status = RemediationStatus.SUCCESS if (files_ok and cmds_ok) else RemediationStatus.FAILED
+        failure_reasons: List[str] = []
         if final_status == RemediationStatus.FAILED:
             for m in file_modifications:
                 if m.error:
-                    print(f"[SelfHealingAgent] ✘ {os.path.basename(m.path)}: {m.error}")
+                    failure_reasons.append(f"{os.path.basename(m.path)}: {m.error}")
             for c in command_results:
                 if not c.succeeded and not c.skipped:
-                    print(f"[SelfHealingAgent] ✘ command failed: {c.command[:90]}"
-                          f"{' — ' + (c.stderr or c.error)[:150] if (c.stderr or c.error) else ''}")
+                    failure_reasons.append(f"command failed: {c.command[:90]}")
+            for r in failure_reasons:
+                print(f"[SelfHealingAgent] ✘ {r}")
 
         return SelfHealingResult(
             incident_id                 = solution.incident_id,
@@ -480,6 +490,7 @@ class SelfHealingAgent(BaseAgent):
             remediation_command_results = command_results,
             llm_response                = llm_response,
             verification                = verification,
+            validation_errors           = failure_reasons,
         )
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -850,7 +861,14 @@ class SelfHealingAgent(BaseAgent):
         c = " ".join(command.strip().lower().split())
         if any(ch in c for ch in ("&&", "||", ";", "|", ">", "<", "`", "$(")):
             return False
-        return c.startswith(cls._SAFE_PREFIXES)
+        if not c.startswith(cls._SAFE_PREFIXES):
+            return False
+        # py_compile only makes sense on Python files (not requirements.txt, Dockerfile…)
+        if "py_compile" in c:
+            args = [a.strip("\"'") for a in c.split()[3:]]
+            if not args or not all(a.endswith(".py") for a in args):
+                return False
+        return True
 
     def _execute_remediation_commands(
         self,

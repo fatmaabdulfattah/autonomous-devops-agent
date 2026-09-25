@@ -38,9 +38,8 @@ Before the first run you need **two keys** in a `.env` file inside your project 
 
 Needs **Python 3.10+** and **git**. About 450 MB. 4 GB RAM is enough with a cloud model.
 
-**Recommended (isolated):** create the environment **outside** the project you want to deploy (e.g. in your home folder) — otherwise it gets pushed to GitHub with your code.
+**Recommended (isolated):**
 ```bash
-cd ~                            # or any folder that is NOT your project
 python -m venv .venv
 .venv\Scripts\activate          # Windows
 source .venv/bin/activate       # macOS / Linux
@@ -70,6 +69,7 @@ ANTHROPIC_API_KEY=sk-ant-...  # https://console.anthropic.com
 
 # Required for pushing to GitHub
 GITHUB_TOKEN=ghp_...
+GITHUB_REPO=https://github.com/you/your-project.git   # optional — otherwise you're asked once
 ```
 
 **GitHub token:** github.com → Settings → Developer settings → Personal access tokens → **Tokens (classic)** → Generate → tick **`repo`** and **`workflow`**.
@@ -92,7 +92,7 @@ The generated pipeline builds your Docker image and pushes it to Docker Hub, so 
    - `DOCKER_USERNAME` = your Docker Hub username
    - `DOCKER_PASSWORD` = the token from step 1
 
-Without these, the first pipeline fails at *docker login* — the agent will tell you, but it can't fix secrets for you.
+Without these, the first pipeline fails at *docker login* — the agent will tell you, but it can't fix secrets for you. After you add them, choose **[1] Run pipeline again**: since no file changed, the agent asks GitHub to re-run the workflow for you.
 
 ---
 
@@ -100,14 +100,17 @@ Without these, the first pipeline fails at *docker login* — the agent will tel
 
 | You see | What to answer |
 |---|---|
-| **LLM SETUP** for each agent | pick a provider (e.g. `2` Groq or `5` Gemini), `1` to use the saved key, then a model. Choices are remembered. |
+| **LLM SETUP** at start (Scaffold, Monitoring) | pick a provider (e.g. `2` Groq or `5` Gemini), `1` to use the saved key, then a model. Choices are remembered. |
+| **Knowledge / Self-Healing model** — only when an incident happens | first time: pick a provider + model. Later: `Use GEMINI / …?` → **Enter** keeps it, `c` lets you switch. |
 | **Re-generate scaffold files?** (2nd run on) | `no` to keep your files, `yes` to recreate them |
 | **APPROVAL REQUIRED** | `yes` / `no`. Nothing is pushed or changed without this. |
-| **GitHub repo URL** | paste your repo URL, e.g. `https://github.com/you/your-project.git` |
+| **GitHub repo URL** | not asked if `GITHUB_REPO` is in `.env`. Otherwise: paste it the first time, later **Enter** reuses it |
 | **✎ file — N line(s) changed** | the exact diff of every fix (red = removed, green = added) |
 | **CI/CD: success** | done 🎉 |
 
-**What the agent does to your repo:** it commits and pushes to `main` (never a force push — if GitHub has newer commits it stops and tells you to `git pull --rebase origin main`). Fixes are backed up in `.self_healing_backups/`.
+**What the agent does to your repo:** it commits and pushes to `main`. If GitHub has newer commits (a teammate, or a repo created with a README), it first puts your commits on top of theirs — nothing on GitHub is ever deleted, and it never force-pushes. Only if the *same lines* were changed on both sides does it stop and ask you to resolve the conflict once. Fixes are backed up in `.self_healing_backups/`.
+
+**Automatic re-runs:** after a fix is applied, the agent pushes it and re-runs CI/CD by itself — incident after incident — until the pipeline is green. It stops and shows the menu when a problem needs **you** (e.g. Docker Hub secrets, an expired token), when you decline a fix, or when a fix changes nothing new (the same error keeps coming back). You still approve each investigation and fix; `Ctrl+C` stops the loop. Optional hard limit: `DEVOPS_MAX_AUTO_RUNS=10` in `.env`. The repo URL is remembered, so you only type it once.
 
 **Good models to start with:**
 
@@ -120,7 +123,7 @@ Without these, the first pipeline fails at *docker login* — the agent will tel
 
 ## ⚠️ Good to know
 
-- **One error per run.** GitHub stops at the first failing step, so if your project has 3 bugs the agent fixes them over 3 runs (choose `[1] Run pipeline again`). Bugs in the *same file* are usually fixed together.
+- **One error per run.** GitHub stops at the first failing step, so if your project has 3 bugs the agent fixes them over 3 runs — automatically, one after another. Bugs in the *same file* are usually fixed together.
 - **What the pipeline checks:** Python syntax (`compileall`) and the Docker build (including `pip install`). It does **not** start your app, so bugs that only appear at runtime aren't detected yet.
 - **Free-tier limits:** `429` (rate limit) and Gemini `503` (busy) are retried automatically; Gemini falls back to a lighter model if busy.
 
@@ -130,15 +133,16 @@ Without these, the first pipeline fails at *docker login* — the agent will tel
 
 | Problem | Fix |
 |---|---|
-| `'devops' is not recognized` | activate your venv in this terminal (see Windows tip above) — you should see `(.venv)` at the start of the line |
+| `'devops' is not recognized` | activate your venv (see Windows tip above) |
 | `devops --doctor` shows `[FAIL]` | follow the line — usually a missing key in `.env` |
 | `401 Invalid API Key` | the key is wrong or was deleted — create a new one and pick *Enter new token* |
 | `model ... does not exist` / `404` | the provider retired that model — pick another from the list |
 | `429` / `503` / "high demand" | free-tier limit or busy servers — wait a minute and rerun |
 | pipeline fails at `docker login` | add the Docker Hub secrets (see GitHub setup) |
-| `Push rejected` | run `git pull --rebase origin main` in your project, then `devops` again |
+| `merge conflict` when pushing | the same lines changed on GitHub and locally: run `git pull --rebase origin main`, fix the conflict, `git add .` + `git rebase --continue`, then `devops` again |
 | `knowledge_agent` shows `○` | first run needs internet to download the search model; or another `devops` is already running — close it |
-| want to reset saved model choices | delete `~/.devops_agent/llm_config.json` |
+| want to change provider / model | menu **[5] Change AI models** (keys are kept), or press `c` when asked at an incident |
+| `429 ... OTPM Limit 1000` (Groq) | that model's free tier is too small for big fixes — use `openai/gpt-oss-120b` or Gemini |
 | want to reset the knowledge base | delete `~/.devops_agent/qdrant/` |
 
 ---

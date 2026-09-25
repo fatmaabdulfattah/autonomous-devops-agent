@@ -281,11 +281,12 @@ def test_healer_only_runs_safe_commands():
         from auto_devops_agent import _bootstrap; _bootstrap.setup()
         import core.orchestrator
         from agents.self_healing_agent.self_healing_agent import SelfHealingAgent as S
-        ok  = ['python -m py_compile main.py', 'python -m compileall .']
+        ok  = ['python -m py_compile main.py', 'python -m compileall .', 'python -m py_compile "D:/p/main.py"']
         bad = ['git checkout -b fix/x', 'git push', 'docker build -t a .', 'cd "D:/p"',
                'powershell -Command "(Get-Content Dockerfile) -replace a,b"',
                "sed -i 's/a/b/' Dockerfile", 'pip install x && git push', 'rm -rf .',
-               'python -m pip install fastapi==0.141.1', 'pip install -r requirements.txt', 'npm ci']
+               'python -m pip install fastapi==0.141.1', 'pip install -r requirements.txt', 'npm ci',
+               'python -m py_compile D:/devops_test/requirements.txt', 'python -m py_compile Dockerfile']
         assert all(S._is_safe_command(c) for c in ok)
         assert not any(S._is_safe_command(c) for c in bad), [c for c in bad if S._is_safe_command(c)]
         print('ok')
@@ -294,29 +295,306 @@ def test_healer_only_runs_safe_commands():
     assert r.returncode == 0 and "ok" in r.stdout, r.stderr[-1500:]
 
 
-def test_push_leaves_no_token_and_does_not_force(tmp_path):
+def test_knowledge_and_healing_models_are_chosen_lazily(tmp_path):
+    """Scaffold asked at startup; Knowledge/Self-Healing asked only when they run."""
     import textwrap
-    remote = tmp_path / "remote.git"; proj = tmp_path / "proj"; other = tmp_path / "other"
-    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(remote)], check=True)
+    code = textwrap.dedent(f"""
+        import os, asyncio, builtins, hashlib, numpy as np
+        os.environ['DEVOPS_AGENT_HOME'] = r'{tmp_path}'; os.environ['QDRANT_MODE'] = 'embedded'
+        from auto_devops_agent import _bootstrap; _bootstrap.setup()
+        import agents.knowledge_agent.shared.runtime as rt
+        class F:
+            def encode(self, t): return np.ones(384) / 20
+        rt._encoder = F()
+        import devops
+        from core.orchestrator import Orchestrator
+        o = Orchestrator()
+        ka, sh = o.registry.get_agent('knowledge_agent'), o.registry.get_agent('self_healing_agent')
+        assert ka and sh
+        calls = []
+        ka.run = lambda *a, **k: calls.append('ka.run') or 'ran'
+        async def rem(sol): calls.append('sh.remediate'); return 'healed'
+        sh.remediate = rem
+        class P:
+            def __init__(s, n): s.name, s.default_model = n, 'm-' + n
+        asked = []
+        def fake_get(agent, use_saved=False, **k):
+            if use_saved: raise LookupError('none saved')
+            asked.append(agent); return P('gemini')
+        devops.get_llm_provider = fake_get
+        answers = iter(['', 'c'])
+        builtins.input = lambda *a: next(answers)
+        class D:
+            def pause(self): pass
+            def resume(self): pass
+        devops._attach_lazy_llm_choice(o, D())
+        assert asked == []                                  # nothing asked at startup
+        assert ka.run('err') == 'ran'                        # 1st incident: full menu
+        assert asked == ['knowledge'] and ka.agent._provider.name == 'gemini'
+        assert ka.run('err2') == 'ran'                       # 2nd: 'Use GEMINI?' -> Enter keeps it
+        assert asked == ['knowledge']
+        assert asyncio.run(sh.remediate(None)) == 'healed'   # healer: full menu on first use
+        assert asked == ['knowledge', 'healing'], asked
+        print('ok', calls)
+    """)
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, cwd=tmp_path)
+    assert r.returncode == 0 and "ok" in r.stdout, r.stderr[-2500:] + r.stdout[-500:]
+
+
+# ── git sync before push ──────────────────────────────────────────────────────
+def _git(*a, cwd=None):
+    return subprocess.run(["git", *a], cwd=cwd, capture_output=True, text=True)
+
+
+def _push_code(proj, remote):
+    import textwrap
+    return textwrap.dedent(f"""
+        import asyncio
+        from auto_devops_agent import _bootstrap; _bootstrap.setup()
+        from core.orchestrator import Orchestrator
+        o = Orchestrator.__new__(Orchestrator)
+        print('PUSH', asyncio.run(o._push_to_github(r'{proj}', 'file://{remote}', 'ghp_SECRET')))
+        print('URL', Orchestrator._current_remote_url(r'{proj}'))
+    """)
+
+
+def _teammate_commit(remote, tmp_path, fname, text):
+    other = tmp_path / ("mate_" + fname.replace(".", "_"))
+    _git("clone", "-q", str(remote), str(other))
+    (other / fname).write_text(text)
+    _git("add", ".", cwd=other)
+    _git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "teammate " + fname, cwd=other)
+    assert _git("push", "-q", cwd=other).returncode == 0
+
+
+def test_push_syncs_teammate_commits_instead_of_failing(tmp_path):
+    remote = tmp_path / "remote.git"; proj = tmp_path / "proj"
+    _git("init", "-q", "--bare", "-b", "main", str(remote))
+    proj.mkdir(); (proj / "app.py").write_text("x = 1\n")
+    r = subprocess.run([sys.executable, "-c", _push_code(proj, remote)], capture_output=True, text=True, cwd=proj)
+    assert "PUSH True" in r.stdout, r.stderr[-1500:]
+    assert "ghp_SECRET" not in (proj / ".git" / "config").read_text()
+    assert f"URL file://{remote}" in r.stdout                   # remembered, token-free
+    _teammate_commit(remote, tmp_path, "t.txt", "teammate\n")  # GitHub now has a commit we don't
+    (proj / "app.py").write_text("x = 2\n")
+    r = subprocess.run([sys.executable, "-c", _push_code(proj, remote)], capture_output=True, text=True, cwd=proj)
+    assert "PUSH True" in r.stdout, r.stdout + r.stderr[-1500:]
+    files = _git("--git-dir", str(remote), "ls-tree", "-r", "--name-only", "main").stdout
+    assert "t.txt" in files and "app.py" in files               # both sides kept
+    assert _git("--git-dir", str(remote), "show", "main:app.py").stdout == "x = 2\n"
+
+
+def test_push_to_existing_repo_with_unrelated_history(tmp_path):
+    """Repo created on GitHub with a README; local project never pushed before."""
+    remote = tmp_path / "remote.git"; proj = tmp_path / "proj"
+    _git("init", "-q", "--bare", "-b", "main", str(remote))
+    _teammate_commit(remote, tmp_path, "README.md", "# repo made on github\n")
+    proj.mkdir(); (proj / "app.py").write_text("x = 1\n")
+    r = subprocess.run([sys.executable, "-c", _push_code(proj, remote)], capture_output=True, text=True, cwd=proj)
+    assert "PUSH True" in r.stdout, r.stdout + r.stderr[-1500:]
+    files = _git("--git-dir", str(remote), "ls-tree", "-r", "--name-only", "main").stdout
+    assert "README.md" in files and "app.py" in files
+
+
+def test_push_real_conflict_stops_cleanly(tmp_path):
+    remote = tmp_path / "remote.git"; proj = tmp_path / "proj"
+    _git("init", "-q", "--bare", "-b", "main", str(remote))
+    proj.mkdir(); (proj / "app.py").write_text("x = 1\n")
+    subprocess.run([sys.executable, "-c", _push_code(proj, remote)], capture_output=True, text=True, cwd=proj)
+    _teammate_commit(remote, tmp_path, "app.py", "x = 999\n")  # same line changed on GitHub
+    (proj / "app.py").write_text("x = 2\n")
+    r = subprocess.run([sys.executable, "-c", _push_code(proj, remote)], capture_output=True, text=True, cwd=proj)
+    assert "PUSH False" in r.stdout and "merge conflict" in r.stdout, r.stdout
+    assert not (proj / ".git" / "rebase-merge").exists()        # rebase undone
+    assert (proj / "app.py").read_text() == "x = 2\n"           # our work untouched
+    assert _git("--git-dir", str(remote), "show", "main:app.py").stdout == "x = 999\n"
+    assert "ghp_SECRET" not in (proj / ".git" / "config").read_text()
+
+
+def test_auto_rerun_until_cicd_success(tmp_path):
+    """Loop while every run fixes something NEW; stop on success, manual fix,
+    no progress (same/oscillating fix) or the optional limit."""
+    import textwrap
+    code = textwrap.dedent("""
+        import builtins, os
+        from pathlib import Path
+        os.environ.pop('DEVOPS_MAX_AUTO_RUNS', None)
+        from auto_devops_agent import _bootstrap; _bootstrap.setup()
+        import devops
+        builtins.input = lambda *a: '4'
+        app = Path('app.py')
+
+        def scenario(steps):
+            # steps: list of (file content written by the 'fix' or None, cicd, healed)
+            it, calls = iter(steps), []
+            async def fake(rerun=False, auto=False):
+                calls.append(auto)
+                content, cicd, healed = next(it)
+                if content is not None:
+                    app.write_text(content)
+                devops._LAST_RUN['cicd'], devops._LAST_RUN['healed'] = cicd, healed
+            devops._run_scaffold = fake
+            app.write_text('start')
+            devops.main()
+            return calls
+
+        # 7 different healable incidents in a row, then green -> no limit by default
+        steps = [(f'fix{i}', 'failure', True) for i in range(7)] + [(None, 'success', False)]
+        assert scenario(steps) == [False] + [True] * 7
+
+        # same fix again (nothing changes) -> stop, show menu
+        assert scenario([('A', 'failure', True), ('A', 'failure', True)]) == [False, True]
+
+        # oscillation A -> B -> A -> stop
+        assert scenario([('A', 'failure', True), ('B', 'failure', True),
+                         ('A', 'failure', True)]) == [False, True, True]
+
+        # manual fix needed (nothing healed) -> no automatic re-run
+        assert scenario([(None, 'failure', False)]) == [False]
+
+        # optional limit still works
+        os.environ['DEVOPS_MAX_AUTO_RUNS'] = '2'
+        steps = [(f'x{i}', 'failure', True) for i in range(5)]
+        assert scenario(steps) == [False, True, True]
+        print('ok')
+    """)
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, cwd=tmp_path)
+    assert r.returncode == 0 and "ok" in r.stdout, r.stderr[-2500:] + r.stdout[-1500:]
+
+
+def test_ci_result_comes_from_the_pushed_commit_only():
+    """Regression: an OLD successful run was reported as the result of a new push."""
+    import textwrap
+    code = textwrap.dedent("""
+        from auto_devops_agent import _bootstrap; _bootstrap.setup()
+        from core.orchestrator import Orchestrator as O
+        old = {'id': 1, 'head_sha': 'aaa', 'conclusion': 'success', 'path': '.github/workflows/deploy.yml'}
+        new = {'id': 2, 'head_sha': 'bbb', 'conclusion': 'failure', 'path': '.github/workflows/deploy.yml'}
+        other = {'id': 3, 'head_sha': 'bbb', 'conclusion': 'success', 'path': '.github/workflows/lint.yml'}
+        assert O._pick_run([old], 'bbb') is None                  # run not there yet -> keep waiting
+        assert O._pick_run([old, new], 'bbb')['id'] == 2          # never the old commit's run
+        assert O._pick_run([other, new], 'bbb')['id'] == 2        # prefer our deploy.yml
+        assert O._pick_run([other], 'bbb')['id'] == 3
+        print('ok')
+    """)
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert r.returncode == 0 and "ok" in r.stdout, r.stderr[-1500:]
+
+
+def test_push_records_pushed_commit(tmp_path):
+    import textwrap
+    remote = tmp_path / "remote.git"; proj = tmp_path / "proj"
+    _git("init", "-q", "--bare", "-b", "main", str(remote))
     proj.mkdir(); (proj / "app.py").write_text("x = 1\n")
     code = textwrap.dedent(f"""
         import asyncio
         from auto_devops_agent import _bootstrap; _bootstrap.setup()
         from core.orchestrator import Orchestrator
         o = Orchestrator.__new__(Orchestrator)
-        print('push1', asyncio.run(o._push_to_github(r'{proj}', 'file://{remote}', 'ghp_SECRET')))
+        asyncio.run(o._push_to_github(r'{proj}', 'file://{remote}', 't'))
+        print('SHA', o.last_pushed_sha)
     """)
     r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, cwd=proj)
-    assert "push1 True" in r.stdout, r.stderr[-1500:] + r.stdout
-    cfg = (proj / ".git" / "config").read_text()
-    assert "ghp_SECRET" not in cfg, cfg
-    # a teammate pushes; our next push must be rejected, not force-overwrite theirs
-    subprocess.run(["git", "clone", "-q", str(remote), str(other)], check=True)
-    (other / "t.txt").write_text("teammate\n")
-    for c in (["add", "."], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "t"], ["push", "-q"]):
-        subprocess.run(["git", "-C", str(other), *c], check=True)
-    (proj / "app.py").write_text("x = 2\n")
-    r = subprocess.run([sys.executable, "-c", code.replace("push1", "push2")], capture_output=True, text=True, cwd=proj)
-    assert "push2 False" in r.stdout, r.stdout
-    log = subprocess.run(["git", "--git-dir", str(remote), "log", "--oneline", "main"], capture_output=True, text=True).stdout
-    assert " t" in log, log      # teammate's commit survived
+    head = _git("--git-dir", str(remote), "rev-parse", "main").stdout.strip()
+    assert f"SHA {head}" in r.stdout and len(head) == 40, r.stdout + r.stderr[-1000:]
+
+
+def test_change_models_keeps_api_keys(tmp_path, monkeypatch):
+    import textwrap, json
+    monkeypatch.setenv("DEVOPS_AGENT_HOME", str(tmp_path))
+    (tmp_path / "llm_config.json").write_text(json.dumps(
+        {"api_keys": {"groq": "k"}, "agents": {"scaffold": {"provider": "groq", "model": "m"}}}))
+    code = textwrap.dedent("""
+        from auto_devops_agent import _bootstrap; _bootstrap.setup()
+        from providers.llm.llm_selector import reset_agent_choices, get_all_agent_configs
+        reset_agent_choices(); assert get_all_agent_configs() == {}; print('ok')
+    """)
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert r.returncode == 0 and "ok" in r.stdout, r.stderr[-1000:]
+    assert json.loads((tmp_path / "llm_config.json").read_text())["api_keys"] == {"groq": "k"}
+
+
+def test_repo_url_read_from_env():
+    import textwrap
+    code = textwrap.dedent("""
+        import asyncio, os, builtins
+        os.environ['GITHUB_REPO'] = 'https://github.com/me/proj.git'
+        os.environ.pop('GITHUB_TOKEN', None)          # stop right after the URL step
+        from auto_devops_agent import _bootstrap; _bootstrap.setup()
+        from core.orchestrator import Orchestrator
+        from core.event_bus import Event, EventType
+        builtins.input = lambda *a: (_ for _ in ()).throw(AssertionError('asked for URL'))
+        o = Orchestrator(); o.auto_mode = True           # skip the approval gate
+        ev = Event(type=EventType.SCAFFOLD_COMPLETE, source='t',
+                   data={'generated_files': [], 'project_path': '.', 'dry_run': False})
+        asyncio.run(o._on_scaffold_complete(ev))
+        assert o.last_repo_url == 'https://github.com/me/proj.git'
+        print('ok')
+    """)
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert r.returncode == 0 and "ok" in r.stdout, r.stderr[-2000:] + r.stdout[-500:]
+
+
+def test_noop_push_is_detected(tmp_path):
+    import textwrap
+    remote = tmp_path / "remote.git"; proj = tmp_path / "proj"
+    _git("init", "-q", "--bare", "-b", "main", str(remote))
+    proj.mkdir(); (proj / "app.py").write_text("x = 1\n")
+    code = textwrap.dedent(f"""
+        import asyncio
+        from auto_devops_agent import _bootstrap; _bootstrap.setup()
+        from core.orchestrator import Orchestrator
+        o = Orchestrator.__new__(Orchestrator)
+        asyncio.run(o._push_to_github(r'{proj}', 'file://{remote}', 't')); print('FIRST', o.last_push_noop)
+        asyncio.run(o._push_to_github(r'{proj}', 'file://{remote}', 't')); print('SECOND', o.last_push_noop)
+    """)
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, cwd=proj)
+    assert "FIRST False" in r.stdout and "SECOND True" in r.stdout, r.stdout + r.stderr[-1000:]
+
+
+def test_rerun_when_nothing_new_was_pushed():
+    """Secrets fixed on GitHub -> no new commit -> the agent must re-run the workflow,
+    and report the NEW attempt's result (not the old failure)."""
+    import textwrap
+    code = textwrap.dedent("""
+        import asyncio, os
+        os.environ['GITHUB_TOKEN'] = 't'; os.environ['GITHUB_REPO'] = 'https://github.com/me/p.git'
+        from auto_devops_agent import _bootstrap; _bootstrap.setup()
+        import core.orchestrator as orch
+        from core.orchestrator import Orchestrator
+        from core.event_bus import Event, EventType
+        real_sleep = asyncio.sleep
+        orch.asyncio.sleep = lambda *a, **k: real_sleep(0)
+        o = Orchestrator(); o.auto_mode = True
+        class CICD: pass
+        o.registry.register('cicd_agent', CICD()) if hasattr(o.registry, 'register') else o.register_agent('cicd_agent', CICD())
+        async def push(*a, **k):
+            o.last_pushed_sha, o.last_push_noop = 'abc', True
+            return True
+        o._push_to_github = push
+        old = {'id': 7, 'status': 'completed', 'conclusion': 'failure', 'run_attempt': 1, 'head_sha': 'abc'}
+        async def latest(*a, **k): return old
+        o._get_latest_run = latest
+        reruns = []
+        async def rerun(repo, run_id, token): reruns.append(run_id); return True
+        o._rerun_workflow = rerun
+        async def get_run(*a, **k):
+            return {'id': 7, 'status': 'completed', 'conclusion': 'success', 'run_attempt': 2}
+        o._get_run = get_run
+        async def logs(*a, **k): return ['ok']
+        o._get_run_logs = logs
+        async def nomon(): pass
+        o.start_monitoring_agent = nomon
+        seen = []
+        async def capture(ev):
+            if ev.type == EventType.DEPLOYMENT_COMPLETE: seen.append(ev.data['conclusion'])
+        o.event_bus.subscribe(EventType.DEPLOYMENT_COMPLETE, capture)
+        ev = Event(type=EventType.SCAFFOLD_COMPLETE, source='t',
+                   data={'generated_files': [], 'project_path': '.', 'dry_run': False})
+        asyncio.run(o._on_scaffold_complete(ev))
+        assert reruns == [7], reruns
+        assert seen == ['success'], seen
+        print('ok')
+    """)
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert r.returncode == 0 and "ok" in r.stdout, r.stderr[-3000:] + r.stdout[-1500:]
