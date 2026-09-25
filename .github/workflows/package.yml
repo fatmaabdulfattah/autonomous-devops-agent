@@ -1,0 +1,22 @@
+name: package
+on: [push, pull_request]
+jobs:
+  build-and-smoke:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "${{ matrix.python }}" }
+      - run: pip install build pytest
+      - run: python -m build
+      - name: install wheel (base profile) and smoke test outside repo
+        shell: bash
+        run: |
+          pip install dist/*.whl
+          cd "$RUNNER_TEMP"
+          devops --version
+          pytest -q "$GITHUB_WORKSPACE/tests/test_packaging.py"

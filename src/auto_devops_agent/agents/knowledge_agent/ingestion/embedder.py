@@ -1,0 +1,28 @@
+
+"""
+ingestion/embedder.py
+---------------------
+Step 4 — Chunk → EmbeddedChunk(vector, text, metadata).
+"""
+
+#from google import genai # for use gemini embedding 
+from agents.knowledge_agent.shared.runtime import get_encoder
+from agents.knowledge_agent.shared.models import Chunk, EmbeddedChunk
+from agents.knowledge_agent.shared.config import Config
+
+
+
+def embed_chunks(chunks: list[Chunk]) -> list[EmbeddedChunk]:
+    model = get_encoder()
+    embedded = []
+
+    for chunk in chunks:
+        vector = model.encode(chunk.text).tolist()
+        embedded.append(EmbeddedChunk(
+            vector=vector,
+            text=chunk.text,
+            metadata=chunk.metadata,
+        ))
+
+    print(f"[Embedder] Done — {len(embedded)} vectors, dim={len(embedded[0].vector)}")
+    return embedded

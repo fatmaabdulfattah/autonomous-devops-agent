@@ -1,0 +1,64 @@
+# Zero-manual-setup bundle: Qdrant + Ollama + the devops CLI
+#
+#   1. cp .env.template .env        (fill GROQ_API_KEY / GITHUB_TOKEN)
+#   2. docker compose up -d         (starts Qdrant + Ollama, pulls the model once)
+#   3. PROJECT_DIR=/path/to/your/project docker compose run --rm devops
+#
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    restart: unless-stopped
+    ports: ["6333:6333"]
+    volumes: [qdrant_data:/qdrant/storage]
+
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    ports: ["11434:11434"]
+    volumes: [ollama_data:/root/.ollama]
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    # NVIDIA GPU? uncomment:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices: [{ driver: nvidia, count: all, capabilities: [gpu] }]
+
+  ollama-pull:                      # one-shot: downloads the model into the ollama volume
+    image: ollama/ollama:latest
+    depends_on:
+      ollama: { condition: service_healthy }
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["ollama", "pull", "${OLLAMA_MODEL:-llama3.2:3b}"]
+    restart: "no"
+
+  devops:
+    build: .
+    image: autonomous-devops-agent:0.1.0
+    profiles: ["cli"]               # not started by `up`; use `docker compose run --rm devops`
+    stdin_open: true
+    tty: true
+    depends_on:
+      qdrant: { condition: service_started }
+      ollama: { condition: service_healthy }
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      QDRANT_HOST: qdrant
+      QDRANT_PORT: "6333"
+      OLLAMA_HOST: http://ollama:11434
+    volumes:
+      - ${PROJECT_DIR:-./workspace}:/workspace       # the project you want to deploy
+      - agent_home:/root/.devops_agent               # saved LLM choices + embedding model cache
+      # Let the agent run docker build/run on your machine (grants host root-equivalent access):
+      # - /var/run/docker.sock:/var/run/docker.sock
+
+volumes:
+  qdrant_data:
+  ollama_data:
+  agent_home:

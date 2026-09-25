@@ -1,0 +1,13 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+dist/
+build/
+*.egg-info/
+.devops/
+.devops_state
+.devops_llm_config
+.self_healing_backups/
