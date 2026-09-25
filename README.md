@@ -38,8 +38,9 @@ Before the first run you need **two keys** in a `.env` file inside your project 
 
 Needs **Python 3.10+** and **git**. About 450 MB. 4 GB RAM is enough with a cloud model.
 
-**Recommended (isolated):**
+**Recommended (isolated):** create the environment **outside** the project you want to deploy (e.g. in your home folder) — otherwise it gets pushed to GitHub with your code.
 ```bash
+cd ~                            # or any folder that is NOT your project
 python -m venv .venv
 .venv\Scripts\activate          # Windows
 source .venv/bin/activate       # macOS / Linux
@@ -129,7 +130,7 @@ Without these, the first pipeline fails at *docker login* — the agent will tel
 
 | Problem | Fix |
 |---|---|
-| `'devops' is not recognized` | activate your venv (see Windows tip above) |
+| `'devops' is not recognized` | activate your venv in this terminal (see Windows tip above) — you should see `(.venv)` at the start of the line |
 | `devops --doctor` shows `[FAIL]` | follow the line — usually a missing key in `.env` |
 | `401 Invalid API Key` | the key is wrong or was deleted — create a new one and pick *Enter new token* |
 | `model ... does not exist` / `404` | the provider retired that model — pick another from the list |
