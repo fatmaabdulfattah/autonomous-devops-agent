@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "autonomous-devops-agent"
-version = "0.1.0"
+version = "0.1.1"
 description = "Multi-agent DevOps CLI: scaffolds Docker/CI/k8s, runs GitHub Actions, monitors and self-heals — with human approval gates."
 readme = "README.md"
 requires-python = ">=3.10"
